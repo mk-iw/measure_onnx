@@ -79,8 +79,8 @@ lastCapturedFrame.width = 1920; lastCapturedFrame.height = 1080;
 const lctx = lastCapturedFrame.getContext('2d', { alpha: false });
 
 let points = {
-    p1: {x: 400, y: 540, label: "口先"},
-    p2: {x: 900, y: 540, label: "尾叉"}
+    p1: {x: 400, y: 500, label: "口先"},
+    p2: {x: 900, y: 580, label: "尾叉"}
 };
 
 const video = document.getElementById('video');
@@ -315,6 +315,27 @@ function processArUcoDetection(imageSource) {
     return true;
 }
 
+// 点がID 40〜43のポリゴン内部に含まれているかを判定（レイキャスティング法）
+function isPointInArucoBounds(px, py) {
+    if (!globalCorners[40] || !globalCorners[41] || !globalCorners[42] || !globalCorners[43]) {
+        return true; // コーナーが揃っていない場合は枠判定を行わない
+    }
+    const poly = [
+        { x: globalCorners[40].tl.x, y: globalCorners[40].tl.y },
+        { x: globalCorners[41].tr.x, y: globalCorners[41].tr.y },
+        { x: globalCorners[43].br.x, y: globalCorners[43].br.y },
+        { x: globalCorners[42].bl.x, y: globalCorners[42].bl.y }
+    ];
+    let inside = false;
+    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+        let xi = poly[i].x, yi = poly[i].y;
+        let xj = poly[j].x, yj = poly[j].y;
+        let intersect = ((yi > py) !== (yj > py)) && (px < (xj - xi) * (py - yi) / (yj - yi) + xi);
+        if (intersect) inside = !inside;
+    }
+    return inside;
+}
+
 function warpImageToScale() {
     if (!cvReady || !globalCorners[40] || !globalCorners[41] || !globalCorners[42] || !globalCorners[43]) {
         isWarped = false;
@@ -425,16 +446,15 @@ function captureAndDetect() {
                 alert("魚体を検出できませんでした（5回連続失敗）。HOLDを解除します。");
                 toggleHold(false);
             } else {
-                // 再度フレームをキャプチャして検出を試みる
                 captureAndDetect();
             }
         } else {
-            failCount = 0; // 検出成功時にカウントリセット
+            failCount = 0; 
         }
     }, 100);
 }
 
-// セグメンテーション（ONNXモデル）による魚体検出のみを実施
+// セグメンテーション（ONNXモデル）による魚体検出（ID 40〜43 内限定）
 async function asyncDetectONNX() {
     if (!onnxSession) {
         console.warn("ONNX session not initialized.");
@@ -466,8 +486,10 @@ async function asyncDetectONNX() {
         const output = results[onnxSession.outputNames[0]];
 
         if (output && output.data && output.data.length > 0) {
-            // ONNX出力からの魚体境界（最左端・最右端）の計算処理
-            let minX = Infinity, maxX = -Infinity, centerY = h / 2;
+            let p1Cand = null; // 口先候補 (左)
+            let p2Cand = null; // 尾叉候補 (右)
+            let minX = Infinity, maxX = -Infinity;
+
             const data = output.data;
             const numDetections = output.dims[2] || output.dims[1] || 0;
 
@@ -477,20 +499,32 @@ async function asyncDetectONNX() {
                     let cx = data[0 * numDetections + i] * (w / 640);
                     let cy = data[1 * numDetections + i] * (h / 640);
                     let bw = data[2 * numDetections + i] * (w / 640);
-                    
-                    let left = cx - bw / 2;
-                    let right = cx + bw / 2;
-                    
-                    if (left < minX) minX = left;
-                    if (right > maxX) maxX = right;
-                    centerY = cy;
+                    let bh = data[3 * numDetections + i] * (h / 640);
+
+                    // ID 40〜43 範囲外の場合は除外（Warp処理未実施の時のみ判定）
+                    if (!isWarped && !isPointInArucoBounds(cx, cy)) {
+                        continue;
+                    }
+
+                    let leftX = cx - bw / 2;
+                    let rightX = cx + bw / 2;
+
+                    if (leftX < minX) {
+                        minX = leftX;
+                        p1Cand = { x: leftX, y: cy };
+                    }
+                    if (rightX > maxX) {
+                        maxX = rightX;
+                        p2Cand = { x: rightX, y: cy };
+                    }
                 }
             }
 
-            if (minX < maxX && minX !== Infinity) {
-                points.p1.x = minX;
-                points.p2.x = maxX;
-                points.p1.y = points.p2.y = centerY;
+            if (p1Cand && p2Cand && minX < maxX) {
+                points.p1.x = p1Cand.x;
+                points.p1.y = p1Cand.y;
+                points.p2.x = p2Cand.x;
+                points.p2.y = p2Cand.y;
                 return true; // 検出成功
             }
         }
@@ -521,8 +555,6 @@ function render() {
 
     const imgToDraw = isHolding ? (isWarped ? warpedCanvas : lastCapturedFrame) : video;
     ctx.drawImage(imgToDraw, ox, oy, baseW * scale, baseH * scale);
-
-    const fSize = canvas.height / 25;
 
     // プレビュー時のマーカー検出枠描画
     if (!isHolding || !isWarped) {
@@ -555,36 +587,52 @@ function render() {
         ctx.fillText(arucoStatusText, stageW/2, stageH/2);
     }
 
-    // HOLD時のサイズ計測結果表示
-    if (isHolding && mmRatio > 0) {
-        const forkPx = Math.hypot(points.p2.x - points.p1.x, points.p2.y - points.p1.y);
-        const sizeCm = (forkPx * mmRatio / 10).toFixed(1);
-        ctx.font = "bold 60px sans-serif";
-        const metrics = ctx.measureText(sizeCm + " cm");
-        const boxW = metrics.width + 80; const boxH = 100;
-
-        const boxX = stageW / 2; 
-        const boxY = 150;
-        
-        ctx.fillStyle = "white"; ctx.fillRect(boxX - boxW/2, boxY - boxH/2, boxW, boxH);
-        ctx.strokeStyle = "red"; ctx.lineWidth = 6;
-        ctx.strokeRect(boxX - boxW/2, boxY - boxH/2, boxW, boxH);
-        ctx.fillStyle = "black"; ctx.textAlign = "center"; ctx.fillText(sizeCm + " cm", boxX, boxY + 20);
-    }
+    // 口先と尾叉を結ぶ線分および各ポイントの描画
+    ctx.strokeStyle = "#00ff00";
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(ox + points.p1.x * scale, oy + points.p1.y * scale);
+    ctx.lineTo(ox + points.p2.x * scale, oy + points.p2.y * scale);
+    ctx.stroke();
 
     const labelSize = canvas.height / 30;
-    const marginL = 50; 
-
-    // 情報テキスト
-    drawStyledText(`水槽${tankId} No.${String(currentNo).padStart(3, '0')}`, marginL, 120, labelSize);
-    drawStyledText(`Status: ${arucoStatusText}`, marginL, 170, labelSize * 0.7);
-
-    // 口先・尾叉の描画
     Object.values(points).forEach(p => {
         ctx.strokeStyle = "red"; ctx.lineWidth = 4;
         ctx.beginPath(); ctx.arc(ox + p.x * scale, oy + p.y * scale, 15, 0, Math.PI*2); ctx.stroke();
-        drawStyledText(p.label, ox + p.x * scale + 20, oy + p.y * scale - 20, labelSize * 0.4);
+        drawStyledText(p.label, ox + p.x * scale + 20, oy + p.y * scale - 20, labelSize * 0.7);
     });
+
+    // HOLD時のサイズ計測結果表示 (画面右下に配置)
+    if (isHolding && mmRatio > 0) {
+        // 口先と尾叉の2点間距離（斜め対応）を計算
+        const forkPx = Math.hypot(points.p2.x - points.p1.x, points.p2.y - points.p1.y);
+        const sizeCm = (forkPx * mmRatio / 10).toFixed(1);
+        
+        ctx.font = "bold 60px sans-serif";
+        const metrics = ctx.measureText(sizeCm + " cm");
+        const boxW = metrics.width + 60; 
+        const boxH = 90;
+
+        // 右下に配置 (右端・下端から30px余白)
+        const boxX = stageW - boxW/2 - 30; 
+        const boxY = stageH - boxH/2 - 30;
+        
+        ctx.fillStyle = "white"; 
+        ctx.fillRect(boxX - boxW/2, boxY - boxH/2, boxW, boxH);
+        ctx.strokeStyle = "red"; 
+        ctx.lineWidth = 6;
+        ctx.strokeRect(boxX - boxW/2, boxY - boxH/2, boxW, boxH);
+        ctx.fillStyle = "black"; 
+        ctx.textAlign = "center"; 
+        ctx.fillText(sizeCm + " cm", boxX, boxY + 20);
+    }
+
+    const marginL = 50; 
+
+    // 左上 情報テキスト
+    ctx.textAlign = "left";
+    drawStyledText(`水槽${tankId} No.${String(currentNo).padStart(3, '0')}`, marginL, 120, labelSize);
+    drawStyledText(`Status: ${arucoStatusText}`, marginL, 170, labelSize * 0.7);
 
     if (activePoint && isHolding) {
         drawMagnifier(ox, oy, scale, isWarped ? warpedCanvas : lastCapturedFrame);
