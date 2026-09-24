@@ -304,7 +304,6 @@ function processArUcoDetection(imageSource) {
         let c = globalCorners[30];
         let dPx = (Math.hypot(c.tl.x-c.tr.x, c.tl.y-c.tr.y) + Math.hypot(c.bl.x-c.br.x, c.bl.y-c.br.y)) / 2.0;
         let ratio30 = (60.0 * printScale) / dPx;
-        // 基準不一致の判定閾値を0.05から0.15に緩和
         if (Math.abs(ratio0_9 - ratio30) / ratio0_9 > 0.15) {
             arucoStatusText = "警告: 基準不一致";
             return false;
@@ -395,7 +394,6 @@ function detectArUcoAndCalibrate() {
 
 function testArUcoNow() {
     clearTimeout(testDisplayTimer);
-    // ボタンの再実行を保証するため直前状態をリセット
     detectedArUcoPoints = [];
     globalCorners = {};
 
@@ -459,7 +457,7 @@ function captureAndDetect() {
     }, 100);
 }
 
-// ONNXモデルからの魚体推論
+// ONNXモデルからの魚体推論（アスペクト比を保つLetterbox処理適用）
 async function asyncDetectONNX() {
     if (!onnxSession) {
         console.warn("ONNX session not initialized.");
@@ -471,10 +469,20 @@ async function asyncDetectONNX() {
         const w = targetCanvas.width;
         const h = targetCanvas.height;
 
+        // アスペクト比を保ち640x640にLetterbox描画する処理
         const inputCanvas = document.createElement('canvas');
         inputCanvas.width = 640; inputCanvas.height = 640;
         const ictx = inputCanvas.getContext('2d');
-        ictx.drawImage(targetCanvas, 0, 0, 640, 640);
+        ictx.fillStyle = '#000000';
+        ictx.fillRect(0, 0, 640, 640);
+
+        const scale = Math.min(640 / w, 640 / h);
+        const nw = w * scale;
+        const nh = h * scale;
+        const dx = (640 - nw) / 2;
+        const dy = (640 - nh) / 2;
+
+        ictx.drawImage(targetCanvas, 0, 0, w, h, dx, dy, nw, nh);
         const imgData = ictx.getImageData(0, 0, 640, 640).data;
 
         const float32Data = new Float32Array(1 * 3 * 640 * 640);
@@ -528,14 +536,14 @@ async function asyncDetectONNX() {
                     score = numChannels > 4 ? data[base + 4] : 1.0;
                 }
 
-                // 検出の信頼度スコア閾値を0.35から0.25に調整し検出感度を改善
                 if (score > 0.25 && score > bestScore) {
-                    let realCx = cx * (w / 640);
-                    let realCy = cy * (h / 640);
-                    let realW = bw * (w / 640);
-                    let realH = bh * (h / 640);
+                    // 640x640座標から余白分を差し引いて元の解像度へ変換
+                    let realCx = (cx - dx) / scale;
+                    let realCy = (cy - dy) / scale;
+                    let realW = bw / scale;
+                    let realH = bh / scale;
 
-                    // 補正前かつArUco領域「内部」に入っている誤検出を除外
+                    // 要求指示1に基づき、既存のフィルタリング条件を維持
                     if (!isWarped && isPointInArucoBounds(realCx, realCy)) continue;
 
                     bestScore = score;
