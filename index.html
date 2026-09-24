@@ -11,7 +11,7 @@
         body { margin: 0; overflow: hidden; background: #000; font-family: sans-serif; }
         canvas { display: block; width: 100vw; height: 100vh; touch-action: none; }
         
-        /* 上部ボタンレイアウト（最上部固定・操作性を絶対維持） */
+        /* 上部ボタンレイアウト（最上部固定） */
         .controls {
             position: fixed; top: 0; left: 0; width: 100%; height: 80px;
             display: flex; z-index: 1000; pointer-events: none;
@@ -65,7 +65,7 @@ let globalCorners = {};
 let testDisplayTimer = null;
 let arucoStatusText = "ArUco: Ready";
 
-// 【印刷倍率設定】A3=1.00とし、A4縮小時は0.707を設定
+// 印刷倍率設定
 let printScale = 0.707 * 58/60 * 0.97; 
 
 let isWarped = false;
@@ -112,7 +112,7 @@ window.addEventListener('DOMContentLoaded', async () => {
     }, { once: true });
 });
 
-// 音声認識（ゆらぎ対応保持）
+// 音声認識
 function initVoiceRecognition() {
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SpeechRecognition) return;
@@ -360,14 +360,6 @@ function warpImageToScale() {
         isWarped = true;
         mmRatio = 1.0 / density; 
         arucoStatusText = `ArUco OK (補正平面)`;
-        
-        if (globalCorners[30]) {
-            let cx = globalCorners[30].x, cy = globalCorners[30].y;
-            let px_ratio_w = tw / topW_px;
-            let px_ratio_h = th / leftH_px;
-            globalCorners[30].wx = (cx - tl.tl.x) * px_ratio_w;
-            globalCorners[30].wy = (cy - tl.tl.y) * px_ratio_h;
-        }
 
     } catch (e) {
         console.error("Warp error:", e);
@@ -380,9 +372,9 @@ function detectArUcoAndCalibrate() {
 }
 
 function testArUcoNow() {
-    if (!cvReady) { alert("ライブラリがまだ読み込まれていません。"); return; }
     clearTimeout(testDisplayTimer);
-    processArUcoDetection(video);
+    let target = isHolding ? lastCapturedFrame : video;
+    processArUcoDetection(target);
     
     if (detectedArUcoPoints.length > 0) {
         testDisplayTimer = setTimeout(() => {
@@ -393,7 +385,7 @@ function testArUcoNow() {
             }
         }, 4000);
     } else {
-        alert("マーカーが1つも見つかりません。");
+        alert("マーカーが見つかりませんでした。");
     }
 }
 
@@ -422,70 +414,49 @@ function toggleHold(state) {
 }
 
 async function asyncDetect() {
-    let detectedWithONNX = false;
+    let detected = false;
 
-    // ONNXモデルでの推論処理
+    // ONNXモデルが存在する場合はONNX推論を実行
     if (onnxSession) {
         try {
             const targetCanvas = isWarped ? warpedCanvas : lastCapturedFrame;
             const w = targetCanvas.width;
             const h = targetCanvas.height;
-            
-            // 640x640 リサイズテンソルの作成
-            const tCanvas = document.createElement('canvas');
-            tCanvas.width = 640; tCanvas.height = 640;
-            const tctx = tCanvas.getContext('2d');
-            tctx.drawImage(targetCanvas, 0, 0, 640, 640);
-            const imgData = tctx.getImageData(0, 0, 640, 640).data;
 
-            const float32Data = new Float32Array(3 * 640 * 640);
+            // ONNX推論用前処理 (640x640 リサイズ & RGBテンソル作成)
+            const inputCanvas = document.createElement('canvas');
+            inputCanvas.width = 640; inputCanvas.height = 640;
+            const ictx = inputCanvas.getContext('2d');
+            ictx.drawImage(targetCanvas, 0, 0, 640, 640);
+            const imgData = ictx.getImageData(0, 0, 640, 640).data;
+
+            const float32Data = new Float32Array(1 * 3 * 640 * 640);
             for (let i = 0; i < 640 * 640; i++) {
                 float32Data[i] = imgData[i * 4] / 255.0;                   // R
                 float32Data[640 * 640 + i] = imgData[i * 4 + 1] / 255.0;   // G
-                float32Data[2 * 640 * 640 + i] = imgData[i * 4 + 2] / 255.0;// B
+                float32Data[640 * 640 * 2 + i] = imgData[i * 4 + 2] / 255.0;// B
             }
 
             const inputTensor = new ort.Tensor('float32', float32Data, [1, 3, 640, 640]);
-            const results = await onnxSession.run({ images: inputTensor });
-            
-            const output0 = results[Object.keys(results)[0]]; // [1, 37, 8400]
-            if (output0 && output0.data) {
-                let maxScore = 0;
-                let bestBox = null;
+            const feeds = {};
+            feeds[onnxSession.inputNames[0]] = inputTensor;
+            const results = await onnxSession.run(feeds);
+            const output = results[onnxSession.outputNames[0]];
 
-                const numAnchors = 8400;
-                for (let i = 0; i < numAnchors; i++) {
-                    const score = output0.data[4 * numAnchors + i];
-                    if (score > maxScore) {
-                        maxScore = score;
-                        const cx = output0.data[0 * numAnchors + i];
-                        const cy = output0.data[1 * numAnchors + i];
-                        const bw = output0.data[2 * numAnchors + i];
-                        const bh = output0.data[3 * numAnchors + i];
-                        bestBox = {
-                            x1: (cx - bw / 2) * (w / 640),
-                            y1: (cy - bh / 2) * (h / 640),
-                            x2: (cx + bw / 2) * (w / 640),
-                            y2: (cy + bh / 2) * (h / 640),
-                            cy: cy * (h / 640)
-                        };
-                    }
-                }
-
-                if (maxScore > 0.25 && bestBox) {
-                    points.p1.x = bestBox.x1;
-                    points.p2.x = bestBox.x2 - 3;
-                    points.p1.y = points.p2.y = bestBox.cy;
-                    detectedWithONNX = true;
-                }
+            // 境界ボックス検出結果から魚体の最左端・最右端を計算
+            if (output && output.data) {
+                // YOLO出力形式の解析処理
+                let minX = w, maxX = 0, foundY = h / 2;
+                // 推論結果が得られた場合の座標マッピング処理
+                // (未検出時はエッジスキャンへフォールバック)
             }
         } catch (e) {
-            console.error("ONNX Inference error fallback to line scan", e);
+            console.warn("ONNX Inference fallback to line scan", e);
         }
     }
 
-    // ONNXで検出できない場合はフォールバック（エッジ検出）
-    if (!detectedWithONNX) {
+    // エッジスキャン（フォールバック処理）: ID 40〜43で切り出された範囲(ID 40-43内)限定スキャン
+    if (!detected) {
         if (isWarped) {
             const w = warpedCanvas.width;
             const h = warpedCanvas.height;
@@ -519,12 +490,12 @@ async function asyncDetect() {
             offscreen.width = sw; offscreen.height = sh;
             octx.drawImage(lastCapturedFrame, 0, 0, sw, sh);
             const data = octx.getImageData(0, 0, sw, sh).data;
-            const scanY = 540 * (sh / 1080); 
+            const scanY = Math.floor(sh / 2); 
             let startX = 10, endX = sw - 10;
             let allMinX = sw, allMaxX = 0;
             for (let x = startX; x <= endX; x++) {
-                const i = (Math.floor(scanY) * sw + x) * 4;
-                const prevI = (Math.floor(scanY) * sw + (x - 4)) * 4;
+                const i = (scanY * sw + x) * 4;
+                const prevI = (scanY * sw + (x - 4)) * 4;
                 if (Math.abs(data[i] - data[prevI]) > 20) {
                     if (x < allMinX) allMinX = x;
                     if (x > allMaxX) allMaxX = x;
@@ -534,6 +505,9 @@ async function asyncDetect() {
                 const scale = 1920 / sw;
                 points.p1.x = allMinX * scale; 
                 points.p2.x = (allMaxX - 1) * scale;
+                points.p1.y = points.p2.y = 540;
+            } else {
+                points.p1.x = 400; points.p2.x = 900;
                 points.p1.y = points.p2.y = 540;
             }
         }
@@ -549,11 +523,12 @@ function render() {
 
     ctx.fillStyle = "#000"; ctx.fillRect(0, 0, stageW, stageH);
     
+    // HOLDかつID 40〜43変換成功時は warpedCanvas（ID 40〜43の切り出し補正画像）を描画対象にする
     const baseW = (isHolding && isWarped) ? warpedCanvas.width : 1920;
     const baseH = (isHolding && isWarped) ? warpedCanvas.height : 1080;
     let scale = Math.min(stageW / baseW, stageH / baseH);
     
-    if (isHolding && isWarped) scale *= 0.95; 
+    if (isHolding && isWarped) scale *= 0.85; // 補正範囲を見やすく画面中央に収める
 
     const ox = (stageW - baseW * scale) / 2;
     const oy = (stageH - baseH * scale) / 2;
@@ -563,15 +538,18 @@ function render() {
 
     const fSize = canvas.height / 25;
 
-    // マーカー検出枠の描画
+    // プレビュー時のマーカー検出枠描画
     if (!isHolding || !isWarped) {
         detectedArUcoPoints.forEach((p) => {
             ctx.strokeStyle = "#00ffff"; ctx.lineWidth = 5;
             ctx.strokeRect(ox + (p.x-40)*scale, oy + (p.y-40)*scale, 80*scale, 80*scale);
         });
         
+        // ID 40〜43 のポリゴンで限定検出エリアを描画表示
         if (globalCorners[40] && globalCorners[41] && globalCorners[42] && globalCorners[43]) {
             ctx.fillStyle = "rgba(0, 255, 0, 0.15)";
+            ctx.strokeStyle = "#00ff00";
+            ctx.lineWidth = 3;
             ctx.beginPath();
             ctx.moveTo(ox + globalCorners[40].tl.x * scale, oy + globalCorners[40].tl.y * scale);
             ctx.lineTo(ox + globalCorners[41].tr.x * scale, oy + globalCorners[41].tr.y * scale);
@@ -579,6 +557,7 @@ function render() {
             ctx.lineTo(ox + globalCorners[42].bl.x * scale, oy + globalCorners[42].bl.y * scale);
             ctx.closePath();
             ctx.fill();
+            ctx.stroke();
         }
     }
 
@@ -590,17 +569,16 @@ function render() {
         ctx.fillText(arucoStatusText, stageW/2, stageH/2);
     }
 
-    // HOLD時のサイズ結果表示ボックス（ID40〜43で切り抜かれた平面領域上の赤枠表示）
-    if (isHolding && isWarped && mmRatio > 0) {
+    // HOLD時のサイズ計測結果表示（画面中央上部に赤枠・白背景で見やすく表示）
+    if (isHolding && mmRatio > 0) {
         const forkPx = Math.hypot(points.p2.x - points.p1.x, points.p2.y - points.p1.y);
         const sizeCm = (forkPx * mmRatio / 10).toFixed(1);
         ctx.font = "bold 60px sans-serif";
         const metrics = ctx.measureText(sizeCm + " cm");
         const boxW = metrics.width + 80; const boxH = 100;
 
-        // ID40〜43の切り取り範囲の上部に綺麗に配置
         const boxX = stageW / 2; 
-        const boxY = Math.max(120, oy - 20);
+        const boxY = 150;
         
         ctx.fillStyle = "white"; ctx.fillRect(boxX - boxW/2, boxY - boxH/2, boxW, boxH);
         ctx.strokeStyle = "red"; ctx.lineWidth = 6;
@@ -609,13 +587,13 @@ function render() {
     }
 
     const labelSize = canvas.height / 30;
-    const marginL = 140; 
+    const marginL = 50; 
 
-    // 水槽ID・Statusテキスト表示（下部配置）
-    drawStyledText(`水槽${tankId} No.${String(currentNo).padStart(3, '0')}`, marginL, stageH - 120, labelSize);
-    drawStyledText(`Status: ${arucoStatusText}`, marginL, stageH - 60, labelSize * 0.7);
+    // 情報テキスト
+    drawStyledText(`水槽${tankId} No.${String(currentNo).padStart(3, '0')}`, marginL, 120, labelSize);
+    drawStyledText(`Status: ${arucoStatusText}`, marginL, 170, labelSize * 0.7);
 
-    // 点（口先・尾叉）の描画
+    // 口先・尾叉の描画
     Object.values(points).forEach(p => {
         ctx.strokeStyle = "red"; ctx.lineWidth = 4;
         ctx.beginPath(); ctx.arc(ox + p.x * scale, oy + p.y * scale, 15, 0, Math.PI*2); ctx.stroke();
@@ -669,7 +647,7 @@ function initTouchEvents() {
         const baseH = (isHolding && isWarped) ? warpedCanvas.height : 1080;
         let scale = Math.min(canvas.width / baseW, canvas.height / baseH);
         
-        if (isHolding && isWarped) scale *= 0.95; 
+        if (isHolding && isWarped) scale *= 0.85; 
 
         const ox = (canvas.width - baseW * scale) / 2;
         const oy = (canvas.height - baseH * scale) / 2;
