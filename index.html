@@ -422,65 +422,120 @@ function toggleHold(state) {
 }
 
 async function asyncDetect() {
-    // ONNXモデルでの推論が存在する場合は優先利用
+    let detectedWithONNX = false;
+
+    // ONNXモデルでの推論処理
     if (onnxSession) {
         try {
-            // ONNX推論ロジック
-            console.log("ONNX Inference executing...");
+            const targetCanvas = isWarped ? warpedCanvas : lastCapturedFrame;
+            const w = targetCanvas.width;
+            const h = targetCanvas.height;
+            
+            // 640x640 リサイズテンソルの作成
+            const tCanvas = document.createElement('canvas');
+            tCanvas.width = 640; tCanvas.height = 640;
+            const tctx = tCanvas.getContext('2d');
+            tctx.drawImage(targetCanvas, 0, 0, 640, 640);
+            const imgData = tctx.getImageData(0, 0, 640, 640).data;
+
+            const float32Data = new Float32Array(3 * 640 * 640);
+            for (let i = 0; i < 640 * 640; i++) {
+                float32Data[i] = imgData[i * 4] / 255.0;                   // R
+                float32Data[640 * 640 + i] = imgData[i * 4 + 1] / 255.0;   // G
+                float32Data[2 * 640 * 640 + i] = imgData[i * 4 + 2] / 255.0;// B
+            }
+
+            const inputTensor = new ort.Tensor('float32', float32Data, [1, 3, 640, 640]);
+            const results = await onnxSession.run({ images: inputTensor });
+            
+            const output0 = results[Object.keys(results)[0]]; // [1, 37, 8400]
+            if (output0 && output0.data) {
+                let maxScore = 0;
+                let bestBox = null;
+
+                const numAnchors = 8400;
+                for (let i = 0; i < numAnchors; i++) {
+                    const score = output0.data[4 * numAnchors + i];
+                    if (score > maxScore) {
+                        maxScore = score;
+                        const cx = output0.data[0 * numAnchors + i];
+                        const cy = output0.data[1 * numAnchors + i];
+                        const bw = output0.data[2 * numAnchors + i];
+                        const bh = output0.data[3 * numAnchors + i];
+                        bestBox = {
+                            x1: (cx - bw / 2) * (w / 640),
+                            y1: (cy - bh / 2) * (h / 640),
+                            x2: (cx + bw / 2) * (w / 640),
+                            y2: (cy + bh / 2) * (h / 640),
+                            cy: cy * (h / 640)
+                        };
+                    }
+                }
+
+                if (maxScore > 0.25 && bestBox) {
+                    points.p1.x = bestBox.x1;
+                    points.p2.x = bestBox.x2 - 3;
+                    points.p1.y = points.p2.y = bestBox.cy;
+                    detectedWithONNX = true;
+                }
+            }
         } catch (e) {
             console.error("ONNX Inference error fallback to line scan", e);
         }
     }
 
-    if (isWarped) {
-        const w = warpedCanvas.width;
-        const h = warpedCanvas.height;
-        const wctx = warpedCanvas.getContext('2d', { willReadFrequently: true });
-        const data = wctx.getImageData(0, 0, w, h).data;
-        
-        const scanY = Math.floor(h / 2);
-        let startX = 10;
-        let endX = w - 10;
-        let allMinX = w, allMaxX = 0;
+    // ONNXで検出できない場合はフォールバック（エッジ検出）
+    if (!detectedWithONNX) {
+        if (isWarped) {
+            const w = warpedCanvas.width;
+            const h = warpedCanvas.height;
+            const wctx = warpedCanvas.getContext('2d', { willReadFrequently: true });
+            const data = wctx.getImageData(0, 0, w, h).data;
+            
+            const scanY = Math.floor(h / 2);
+            let startX = 10;
+            let endX = w - 10;
+            let allMinX = w, allMaxX = 0;
 
-        for (let x = startX; x <= endX; x++) {
-            const i = (scanY * w + x) * 4;
-            const prevI = (scanY * w + (x - 4)) * 4;
-            if (Math.abs(data[i] - data[prevI]) > 20) {
-                if (x < allMinX) allMinX = x;
-                if (x > allMaxX) allMaxX = x;
+            for (let x = startX; x <= endX; x++) {
+                const i = (scanY * w + x) * 4;
+                const prevI = (scanY * w + (x - 4)) * 4;
+                if (Math.abs(data[i] - data[prevI]) > 20) {
+                    if (x < allMinX) allMinX = x;
+                    if (x > allMaxX) allMaxX = x;
+                }
             }
-        }
-        
-        if (allMaxX > allMinX + 20) {
-            points.p1.x = allMinX; 
-            points.p2.x = allMaxX - 3;
-            points.p1.y = points.p2.y = scanY;
+            
+            if (allMaxX > allMinX + 20) {
+                points.p1.x = allMinX; 
+                points.p2.x = allMaxX - 3;
+                points.p1.y = points.p2.y = scanY;
+            } else {
+                points.p1.x = w * 0.2; points.p2.x = w * 0.8;
+                points.p1.y = points.p2.y = scanY;
+            }
         } else {
-            points.p1.x = w * 0.2; points.p2.x = w * 0.8;
-            points.p1.y = points.p2.y = scanY;
-        }
-    } else {
-        const sw = 480, sh = 270;
-        offscreen.width = sw; offscreen.height = sh;
-        octx.drawImage(lastCapturedFrame, 0, 0, sw, sh);
-        const data = octx.getImageData(0, 0, sw, sh).data;
-        const scanY = 540 * (sh / 1080); 
-        let startX = 10, endX = sw - 10;
-        let allMinX = sw, allMaxX = 0;
-        for (let x = startX; x <= endX; x++) {
-            const i = (Math.floor(scanY) * sw + x) * 4;
-            const prevI = (Math.floor(scanY) * sw + (x - 4)) * 4;
-            if (Math.abs(data[i] - data[prevI]) > 20) {
-                if (x < allMinX) allMinX = x;
-                if (x > allMaxX) allMaxX = x;
+            const sw = 480, sh = 270;
+            offscreen.width = sw; offscreen.height = sh;
+            octx.drawImage(lastCapturedFrame, 0, 0, sw, sh);
+            const data = octx.getImageData(0, 0, sw, sh).data;
+            const scanY = 540 * (sh / 1080); 
+            let startX = 10, endX = sw - 10;
+            let allMinX = sw, allMaxX = 0;
+            for (let x = startX; x <= endX; x++) {
+                const i = (Math.floor(scanY) * sw + x) * 4;
+                const prevI = (Math.floor(scanY) * sw + (x - 4)) * 4;
+                if (Math.abs(data[i] - data[prevI]) > 20) {
+                    if (x < allMinX) allMinX = x;
+                    if (x > allMaxX) allMaxX = x;
+                }
             }
-        }
-        if (allMaxX > allMinX + 20) {
-            const scale = 1920 / sw;
-            points.p1.x = allMinX * scale; 
-            points.p2.x = (allMaxX - 1) * scale;
-            points.p1.y = points.p2.y = 540;
+            if (allMaxX > allMinX + 20) {
+                const scale = 1920 / sw;
+                points.p1.x = allMinX * scale; 
+                points.p2.x = (allMaxX - 1) * scale;
+                points.p1.y = points.p2.y = 540;
+            }
         }
     }
 }
@@ -508,7 +563,7 @@ function render() {
 
     const fSize = canvas.height / 25;
 
-    // マーカー検出枠の元仕様描画
+    // マーカー検出枠の描画
     if (!isHolding || !isWarped) {
         detectedArUcoPoints.forEach((p) => {
             ctx.strokeStyle = "#00ffff"; ctx.lineWidth = 5;
@@ -527,7 +582,7 @@ function render() {
         }
     }
 
-    // 警告メッセージ判定（元仕様復元）
+    // 警告メッセージ表示
     if (arucoStatusText.startsWith("警告")) {
         ctx.fillStyle = "red";
         ctx.font = "bold 80px sans-serif";
@@ -535,7 +590,7 @@ function render() {
         ctx.fillText(arucoStatusText, stageW/2, stageH/2);
     }
 
-    // HOLD時のサイズ結果表示ボックス（元の仕様通り画面中央上部に配置）
+    // HOLD時のサイズ結果表示ボックス（ID40〜43で切り抜かれた平面領域上の赤枠表示）
     if (isHolding && isWarped && mmRatio > 0) {
         const forkPx = Math.hypot(points.p2.x - points.p1.x, points.p2.y - points.p1.y);
         const sizeCm = (forkPx * mmRatio / 10).toFixed(1);
@@ -543,9 +598,9 @@ function render() {
         const metrics = ctx.measureText(sizeCm + " cm");
         const boxW = metrics.width + 80; const boxH = 100;
 
-        // 画面の中央上部に配置（元の位置関係を復元）
+        // ID40〜43の切り取り範囲の上部に綺麗に配置
         const boxX = stageW / 2; 
-        const boxY = 150;
+        const boxY = Math.max(120, oy - 20);
         
         ctx.fillStyle = "white"; ctx.fillRect(boxX - boxW/2, boxY - boxH/2, boxW, boxH);
         ctx.strokeStyle = "red"; ctx.lineWidth = 6;
@@ -554,11 +609,11 @@ function render() {
     }
 
     const labelSize = canvas.height / 30;
-    const marginL = 50; 
+    const marginL = 140; 
 
-    // 水槽ID・Statusテキスト表示（元仕様の左上配置）
-    drawStyledText(`水槽${tankId} No.${String(currentNo).padStart(3, '0')}`, marginL, 120, labelSize);
-    drawStyledText(`Status: ${arucoStatusText}`, marginL, 170, labelSize * 0.7);
+    // 水槽ID・Statusテキスト表示（下部配置）
+    drawStyledText(`水槽${tankId} No.${String(currentNo).padStart(3, '0')}`, marginL, stageH - 120, labelSize);
+    drawStyledText(`Status: ${arucoStatusText}`, marginL, stageH - 60, labelSize * 0.7);
 
     // 点（口先・尾叉）の描画
     Object.values(points).forEach(p => {
