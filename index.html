@@ -304,7 +304,8 @@ function processArUcoDetection(imageSource) {
         let c = globalCorners[30];
         let dPx = (Math.hypot(c.tl.x-c.tr.x, c.tl.y-c.tr.y) + Math.hypot(c.bl.x-c.br.x, c.bl.y-c.br.y)) / 2.0;
         let ratio30 = (60.0 * printScale) / dPx;
-        if (Math.abs(ratio0_9 - ratio30) / ratio0_9 > 0.05) {
+        // 基準不一致の判定閾値を0.05から0.15に緩和
+        if (Math.abs(ratio0_9 - ratio30) / ratio0_9 > 0.15) {
             arucoStatusText = "警告: 基準不一致";
             return false;
         }
@@ -394,6 +395,10 @@ function detectArUcoAndCalibrate() {
 
 function testArUcoNow() {
     clearTimeout(testDisplayTimer);
+    // ボタンの再実行を保証するため直前状態をリセット
+    detectedArUcoPoints = [];
+    globalCorners = {};
+
     let target = isHolding ? lastCapturedFrame : video;
     processArUcoDetection(target);
     
@@ -454,7 +459,7 @@ function captureAndDetect() {
     }, 100);
 }
 
-// ONNXモデルからの魚体推論（正確な実スケール算出と斜め対応の(X1,Y1), (X2,Y2)設定）
+// ONNXモデルからの魚体推論
 async function asyncDetectONNX() {
     if (!onnxSession) {
         console.warn("ONNX session not initialized.");
@@ -490,7 +495,6 @@ async function asyncDetectONNX() {
             let bestScore = 0;
             let bestObj = null;
 
-            // ONNX出力形状の解析 ([1, 8400, 85] または [1, 85, 8400])
             const dims = output.dims || [1, 85, 8400];
             let numDetections = 8400;
             let numChannels = 85;
@@ -524,7 +528,8 @@ async function asyncDetectONNX() {
                     score = numChannels > 4 ? data[base + 4] : 1.0;
                 }
 
-                if (score > 0.35 && score > bestScore) {
+                // 検出の信頼度スコア閾値を0.35から0.25に調整し検出感度を改善
+                if (score > 0.25 && score > bestScore) {
                     let realCx = cx * (w / 640);
                     let realCy = cy * (h / 640);
                     let realW = bw * (w / 640);
@@ -539,11 +544,9 @@ async function asyncDetectONNX() {
             }
 
             if (bestObj) {
-                // 最左端 (口先: X1) と 尾叉候補位置 (X2)
                 let x1 = bestObj.cx - (bestObj.w / 2);
-                let x2 = (bestObj.cx + (bestObj.w / 2)) - (bestObj.w * 0.06); // 尾先端から尾叉へのオフセット
+                let x2 = (bestObj.cx + (bestObj.w / 2)) - (bestObj.w * 0.06); 
 
-                // 口先Y1 と 尾叉Y2 を高低差・傾きに追従して個別に決定
                 let y1 = bestObj.cy - (bestObj.h * 0.1);
                 let y2 = bestObj.cy + (bestObj.h * 0.1);
 
@@ -631,7 +634,6 @@ function render() {
 
     // HOLD時のサイズ計測結果表示 (画面右下に配置)
     if (isHolding && mmRatio > 0) {
-        // (X1,Y1) と (X2,Y2) の正確な2点間距離を計算
         const forkPx = Math.hypot(points.p2.x - points.p1.x, points.p2.y - points.p1.y);
         const sizeCm = (forkPx * mmRatio / 10).toFixed(1);
         
@@ -640,7 +642,6 @@ function render() {
         const boxW = metrics.width + 60; 
         const boxH = 90;
 
-        // 右下に配置 (右端・下端から30px余白)
         const boxX = stageW - boxW/2 - 30; 
         const boxY = stageH - boxH/2 - 30;
         
