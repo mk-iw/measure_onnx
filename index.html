@@ -318,7 +318,7 @@ function processArUcoDetection(imageSource) {
 // 点がID 40〜43のポリゴン内部に含まれているかを判定（レイキャスティング法）
 function isPointInArucoBounds(px, py) {
     if (!globalCorners[40] || !globalCorners[41] || !globalCorners[42] || !globalCorners[43]) {
-        return true; // コーナーが揃っていない場合は枠判定を行わない
+        return true; 
     }
     const poly = [
         { x: globalCorners[40].tl.x, y: globalCorners[40].tl.y },
@@ -379,6 +379,7 @@ function warpImageToScale() {
         srcMat.delete(); srcCoords.delete(); dstCoords.delete(); M.delete(); dstMat.delete();
         
         isWarped = true;
+        // Warp後の正確なスケール(mm/px)を再設定
         mmRatio = 1.0 / density; 
         arucoStatusText = `ArUco OK (補正平面)`;
 
@@ -414,7 +415,7 @@ function toggleHold(state) {
     isHolding = state;
     clearTimeout(testDisplayTimer);
     if (state) {
-        failCount = 0; // 成功/再検出用のカウントリセット
+        failCount = 0; 
         captureAndDetect();
     } else {
         failCount = 0;
@@ -454,7 +455,7 @@ function captureAndDetect() {
     }, 100);
 }
 
-// セグメンテーション（ONNXモデル）による魚体検出（ID 40〜43 内限定）
+// セグメンテーション（ONNXモデル）による魚体検出 (X1,Y1) と (X2,Y2) の完全独立算出
 async function asyncDetectONNX() {
     if (!onnxSession) {
         console.warn("ONNX session not initialized.");
@@ -486,9 +487,9 @@ async function asyncDetectONNX() {
         const output = results[onnxSession.outputNames[0]];
 
         if (output && output.data && output.data.length > 0) {
-            let p1Cand = null; // 口先候補 (左)
-            let p2Cand = null; // 尾叉候補 (右)
             let minX = Infinity, maxX = -Infinity;
+            let bestP1 = null; // 口先 (X1, Y1)
+            let bestP2 = null; // 尾叉 (X2, Y2)
 
             const data = output.data;
             const numDetections = output.dims[2] || output.dims[1] || 0;
@@ -499,9 +500,8 @@ async function asyncDetectONNX() {
                     let cx = data[0 * numDetections + i] * (w / 640);
                     let cy = data[1 * numDetections + i] * (h / 640);
                     let bw = data[2 * numDetections + i] * (w / 640);
-                    let bh = data[3 * numDetections + i] * (h / 640);
 
-                    // ID 40〜43 範囲外の場合は除外（Warp処理未実施の時のみ判定）
+                    // ID 40〜43 範囲外の場合は除外
                     if (!isWarped && !isPointInArucoBounds(cx, cy)) {
                         continue;
                     }
@@ -509,30 +509,35 @@ async function asyncDetectONNX() {
                     let leftX = cx - bw / 2;
                     let rightX = cx + bw / 2;
 
+                    // 最左端（口先）とその固有のY1座標を保持
                     if (leftX < minX) {
                         minX = leftX;
-                        p1Cand = { x: leftX, y: cy };
+                        bestP1 = { x: leftX, y: cy };
                     }
+                    // 最右端（尾部）とその固有のY2座標を保持
                     if (rightX > maxX) {
                         maxX = rightX;
-                        p2Cand = { x: rightX, y: cy };
+                        // 尾先になりがちな最右端から少し内側(尾叉の位置)に調整
+                        let forkX = rightX - (bw * 0.06); 
+                        bestP2 = { x: Math.max(leftX, forkX), y: cy };
                     }
                 }
             }
 
-            if (p1Cand && p2Cand && minX < maxX) {
-                points.p1.x = p1Cand.x;
-                points.p1.y = p1Cand.y;
-                points.p2.x = p2Cand.x;
-                points.p2.y = p2Cand.y;
-                return true; // 検出成功
+            if (bestP1 && bestP2 && minX < maxX) {
+                // (X1, Y1) と (X2, Y2) をそれぞれ正しく設定
+                points.p1.x = bestP1.x;
+                points.p1.y = bestP1.y;
+                points.p2.x = bestP2.x;
+                points.p2.y = bestP2.y;
+                return true; 
             }
         }
     } catch (e) {
         console.error("ONNX Inference error:", e);
     }
 
-    return false; // 検出失敗
+    return false; 
 }
 
 function renderLoop() { render(); requestAnimationFrame(renderLoop); }
@@ -587,7 +592,7 @@ function render() {
         ctx.fillText(arucoStatusText, stageW/2, stageH/2);
     }
 
-    // 口先と尾叉を結ぶ線分および各ポイントの描画
+    // 口先(X1,Y1) と 尾叉(X2,Y2) を結ぶ線分の描画
     ctx.strokeStyle = "#00ff00";
     ctx.lineWidth = 4;
     ctx.beginPath();
@@ -604,7 +609,7 @@ function render() {
 
     // HOLD時のサイズ計測結果表示 (画面右下に配置)
     if (isHolding && mmRatio > 0) {
-        // 口先と尾叉の2点間距離（斜め対応）を計算
+        // (X1,Y1) と (X2,Y2) の正確な斜め2点間距離を計算
         const forkPx = Math.hypot(points.p2.x - points.p1.x, points.p2.y - points.p1.y);
         const sizeCm = (forkPx * mmRatio / 10).toFixed(1);
         
