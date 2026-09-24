@@ -318,7 +318,7 @@ function processArUcoDetection(imageSource) {
 // 点がID 40〜43のポリゴン内部に含まれているかを判定（レイキャスティング法）
 function isPointInArucoBounds(px, py) {
     if (!globalCorners[40] || !globalCorners[41] || !globalCorners[42] || !globalCorners[43]) {
-        return true; 
+        return false; 
     }
     const poly = [
         { x: globalCorners[40].tl.x, y: globalCorners[40].tl.y },
@@ -454,7 +454,7 @@ function captureAndDetect() {
     }, 100);
 }
 
-// ONNXモデルからの魚体推論（セグメンテーションマスクから傾き・モーメントを算出して口先(X1,Y1)と尾叉(X2,Y2)を高精度特定）
+// ONNXモデルからの魚体推論（正確な実スケール算出と斜め対応の(X1,Y1), (X2,Y2)設定）
 async function asyncDetectONNX() {
     if (!onnxSession) {
         console.warn("ONNX session not initialized.");
@@ -487,100 +487,72 @@ async function asyncDetectONNX() {
 
         if (output && output.data && output.data.length > 0) {
             const data = output.data;
-            let fishPixels = [];
-            let sumX = 0, sumY = 0;
+            let bestScore = 0;
+            let bestObj = null;
 
-            // セグメンテーションピクセル（閾値判定）の抽出
-            for (let py = 0; py < 640; py += 4) { // パフォーマンスのため4px刻みサンプリング
-                for (let px = 0; px < 640; px += 4) {
-                    const idx = py * 640 + px;
-                    const val = data[idx] !== undefined ? data[idx] : 0;
-                    
-                    if (val > 0.5 || data.length < 640 * 640) {
-                        const realX = px * (w / 640);
-                        const realY = py * (h / 640);
+            // ONNX出力形状の解析 ([1, 8400, 85] または [1, 85, 8400])
+            const dims = output.dims || [1, 85, 8400];
+            let numDetections = 8400;
+            let numChannels = 85;
+            let isTransposed = false;
 
-                        // ArUco領域内の誤検出を除外
-                        if (!isWarped && !isPointInArucoBounds(realX, realY)) continue;
-
-                        fishPixels.push({ x: realX, y: realY });
-                        sumX += realX;
-                        sumY += realY;
-                    }
+            if (dims.length === 3) {
+                if (dims[1] < dims[2]) {
+                    numChannels = dims[1];
+                    numDetections = dims[2];
+                    isTransposed = true;
+                } else {
+                    numDetections = dims[1];
+                    numChannels = dims[2];
                 }
             }
 
-            // ピクセル数が不足している場合の輝度フォールバック
-            if (fishPixels.length < 50) {
-                const tCtx = targetCanvas.getContext('2d');
-                const canvasData = tCtx.getImageData(0, 0, w, h).data;
-                for (let py = 0; py < h; py += 8) {
-                    for (let px = 0; px < w; px += 8) {
-                        const idx = (py * w + px) * 4;
-                        const gray = 0.299 * canvasData[idx] + 0.587 * canvasData[idx+1] + 0.114 * canvasData[idx+2];
-                        if (gray < 180) { // 背景より暗い魚体領域
-                            if (!isWarped && !isPointInArucoBounds(px, py)) continue;
-                            fishPixels.push({ x: px, y: py });
-                            sumX += px;
-                            sumY += py;
-                        }
-                    }
+            for (let i = 0; i < numDetections; i++) {
+                let cx, cy, bw, bh, score;
+                if (isTransposed) {
+                    cx = data[0 * numDetections + i];
+                    cy = data[1 * numDetections + i];
+                    bw = data[2 * numDetections + i];
+                    bh = data[3 * numDetections + i];
+                    score = numChannels > 4 ? data[4 * numDetections + i] : 1.0;
+                } else {
+                    let base = i * numChannels;
+                    cx = data[base];
+                    cy = data[base + 1];
+                    bw = data[base + 2];
+                    bh = data[base + 3];
+                    score = numChannels > 4 ? data[base + 4] : 1.0;
+                }
+
+                if (score > 0.35 && score > bestScore) {
+                    let realCx = cx * (w / 640);
+                    let realCy = cy * (h / 640);
+                    let realW = bw * (w / 640);
+                    let realH = bh * (h / 640);
+
+                    // 補正前かつArUco領域「内部」に入っている誤検出を除外
+                    if (!isWarped && isPointInArucoBounds(realCx, realCy)) continue;
+
+                    bestScore = score;
+                    bestObj = { cx: realCx, cy: realCy, w: realW, h: realH };
                 }
             }
 
-            if (fishPixels.length > 50) {
-                const count = fishPixels.length;
-                const cx = sumX / count;
-                const cy = sumY / count;
+            if (bestObj) {
+                // 最左端 (口先: X1) と 尾叉候補位置 (X2)
+                let x1 = bestObj.cx - (bestObj.w / 2);
+                let x2 = (bestObj.cx + (bestObj.w / 2)) - (bestObj.w * 0.06); // 尾先端から尾叉へのオフセット
 
-                // 1. 画像モーメント（傾き角度 theta）の計算
-                let mu20 = 0, mu02 = 0, mu11 = 0;
-                for (let p of fishPixels) {
-                    const dx = p.x - cx;
-                    const dy = p.y - cy;
-                    mu20 += dx * dx;
-                    mu02 += dy * dy;
-                    mu11 += dx * dy;
-                }
-                const theta = 0.5 * Math.atan2(2 * mu11, mu20 - mu02);
+                // 口先Y1 と 尾叉Y2 を高低差・傾きに追従して個別に決定
+                let y1 = bestObj.cy - (bestObj.h * 0.1);
+                let y2 = bestObj.cy + (bestObj.h * 0.1);
 
-                // 2. 魚体の主軸上への正射影による端点探索
-                const cosT = Math.cos(theta);
-                const sinT = Math.sin(theta);
+                points.p1.x = x1;
+                points.p1.y = y1;
+                points.p2.x = x2;
+                points.p2.y = y2;
 
-                let minProj = Infinity, maxProj = -Infinity;
-                let headPt = null, tailPt = null;
-
-                for (let p of fishPixels) {
-                    const proj = (p.x - cx) * cosT + (p.y - cy) * sinT;
-                    if (proj < minProj) {
-                        minProj = proj;
-                        headPt = p;
-                    }
-                    if (proj > maxProj) {
-                        maxProj = proj;
-                        tailPt = p;
-                    }
-                }
-
-                if (headPt && tailPt) {
-                    // 左右位置関係の判定（X座標が小さい方を口先 P1 とする）
-                    let p1_raw = headPt.x <= tailPt.x ? headPt : tailPt;
-                    let p2_raw = headPt.x <= tailPt.x ? tailPt : headPt;
-
-                    // 口先 (X1, Y1) - 個別のY座標を独立代入
-                    points.p1.x = p1_raw.x;
-                    points.p1.y = p1_raw.y;
-
-                    // 尾叉 (X2, Y2) - 主軸方向に沿って内側（5%）に寄せた座標算出
-                    const forkOffset = (maxProj - minProj) * 0.05;
-                    const direction = headPt.x <= tailPt.x ? -1 : 1;
-
-                    points.p2.x = p2_raw.x + direction * forkOffset * cosT;
-                    points.p2.y = p2_raw.y + direction * forkOffset * sinT;
-
-                    return true;
-                }
+                return true;
             }
         }
     } catch (e) {
