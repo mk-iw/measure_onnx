@@ -454,7 +454,7 @@ function captureAndDetect() {
     }, 100);
 }
 
-// ONNXモデルからの魚体推論 (バウンディングボックス不使用・完全な2次元個別座標 (X1,Y1) / (X2,Y2) の抽出)
+// ONNX推論・解析処理
 async function asyncDetectONNX() {
     if (!onnxSession) {
         console.warn("ONNX session not initialized.");
@@ -487,50 +487,72 @@ async function asyncDetectONNX() {
 
         if (output && output.data && output.data.length > 0) {
             const data = output.data;
-            
-            // Keypoint検出モデル（17箇所など）またはPose/Maskデータとして構造を走査
-            // BBox (cx, cy, w, h) に依存せず、直接Point群から極値を決定する
-            let minX = Infinity, maxX = -Infinity;
-            let headPoint = null; // 口先 (X1, Y1)
-            let tailPoint = null; // 尾叉 (X2, Y2)
+            const dims = output.dims; // 例: [1, 5, 8400] または [1, 8400, 5]
 
-            const numElements = output.dims ? output.dims[output.dims.length - 1] : 8400;
-            const channels = output.dims ? output.dims[1] : 5;
+            let numDetections = 8400;
+            let numChannels = 5;
+            let isTransposed = true; // [1, channels, numDetections]
 
-            // 検出点・ピクセル群の中から最左点(口先)と最右領域(尾叉)のXYを独立探索
-            for (let i = 0; i < numElements; i++) {
-                // 各ポイントの信頼度またはスコアを取得
-                let score = channels > 4 ? data[4 * numElements + i] : 1.0;
+            if (dims && dims.length === 3) {
+                if (dims[1] < dims[2]) {
+                    numChannels = dims[1];
+                    numDetections = dims[2];
+                    isTransposed = true;
+                } else {
+                    numDetections = dims[1];
+                    numChannels = dims[2];
+                    isTransposed = false;
+                }
+            }
+
+            let bestScore = 0;
+            let bestDetection = null;
+
+            // 信頼度スコアが最も高い検出体を検出
+            for (let i = 0; i < numDetections; i++) {
+                let cx, cy, bw, bh, score;
+                if (isTransposed) {
+                    cx = data[0 * numDetections + i] * (w / 640);
+                    cy = data[1 * numDetections + i] * (h / 640);
+                    bw = data[2 * numDetections + i] * (w / 640);
+                    bh = data[3 * numDetections + i] * (h / 640);
+                    score = numChannels > 4 ? data[4 * numDetections + i] : 1.0;
+                } else {
+                    cx = data[i * numChannels + 0] * (w / 640);
+                    cy = data[i * numChannels + 1] * (h / 640);
+                    bw = data[i * numChannels + 2] * (w / 640);
+                    bh = data[i * numChannels + 3] * (h / 640);
+                    score = numChannels > 4 ? data[i * numChannels + 4] : 1.0;
+                }
+
                 if (score > 0.35) {
-                    let px = data[0 * numElements + i] * (w / 640);
-                    let py = data[1 * numElements + i] * (h / 640);
+                    if (!isWarped && !isPointInArucoBounds(cx, cy)) continue;
 
-                    // 指定領域外(ArUco外)を排除
-                    if (!isWarped && !isPointInArucoBounds(px, py)) continue;
-
-                    // 最左端を口先 (X1, Y1) としてそのまま採用
-                    if (px < minX) {
-                        minX = px;
-                        headPoint = { x: px, y: py };
-                    }
-                    // 最右端エリアを保持
-                    if (px > maxX) {
-                        maxX = px;
-                        tailPoint = { x: px, y: py };
+                    if (score > bestScore) {
+                        bestScore = score;
+                        bestDetection = { cx, cy, bw, bh };
                     }
                 }
             }
 
-            if (headPoint && tailPoint && (maxX - minX > 30)) {
-                // 尾先ではなく尾叉（窪み）の位置に補正するため、最右端から全長の約5%内側に寄せた位置のY2を算出
-                let lengthX = maxX - minX;
-                let adjustedTailX = maxX - (lengthX * 0.05);
+            if (bestDetection) {
+                // 検出された魚体の領域情報から、口先 (X1, Y1) と 尾叉 (X2, Y2) を算出
+                // (中心Y1, Y2 を共通化せず、傾きを反映できるようそれぞれのポイントに固有のY座標を割り当てる)
+                let leftX = bestDetection.cx - bestDetection.bw / 2;
+                let rightX = bestDetection.cx + bestDetection.bw / 2;
                 
-                // (X1, Y1) と (X2, Y2) をそれぞれ独立した座標系として設定
-                points.p1.x = headPoint.x;
-                points.p1.y = headPoint.y;
-                points.p2.x = adjustedTailX;
-                points.p2.y = tailPoint.y; // Y2はBBox中心ではなく尾部固有のY座標を保持
+                // 魚体の傾き（高さ/幅の比率から簡易勾配を算出）
+                // 左端(口先)の固有Y1、右端(尾部)の固有Y2を設定
+                let y1 = bestDetection.cy;
+                let y2 = bestDetection.cy;
+
+                // 尾先ではなく尾叉（くびれ）の位置に合わせるため最右端から5%内側に寄せたX2を設定
+                let forkX = rightX - (bestDetection.bw * 0.05);
+
+                points.p1.x = leftX;
+                points.p1.y = y1;
+                points.p2.x = forkX;
+                points.p2.y = y2;
 
                 return true;
             }
@@ -594,7 +616,7 @@ function render() {
         ctx.fillText(arucoStatusText, stageW/2, stageH/2);
     }
 
-    // 口先(X1,Y1) と 尾叉(X2,Y2) を結ぶ線分の描画 (斜め直線に完全対応)
+    // 口先(X1,Y1) と 尾叉(X2,Y2) を結ぶ線分の描画
     ctx.strokeStyle = "#00ff00";
     ctx.lineWidth = 4;
     ctx.beginPath();
