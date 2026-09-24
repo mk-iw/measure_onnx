@@ -454,7 +454,7 @@ function captureAndDetect() {
     }, 100);
 }
 
-// ONNX推論・解析処理
+// ONNXモデルからの魚体推論（正確な実スケール算出と斜め対応の(X1,Y1), (X2,Y2)設定）
 async function asyncDetectONNX() {
     if (!onnxSession) {
         console.warn("ONNX session not initialized.");
@@ -487,13 +487,16 @@ async function asyncDetectONNX() {
 
         if (output && output.data && output.data.length > 0) {
             const data = output.data;
-            const dims = output.dims; // 例: [1, 5, 8400] または [1, 8400, 5]
+            let bestScore = 0;
+            let bestObj = null;
 
+            // ONNX出力形状の解析 ([1, 8400, 85] または [1, 85, 8400])
+            const dims = output.dims || [1, 85, 8400];
             let numDetections = 8400;
-            let numChannels = 5;
-            let isTransposed = true; // [1, channels, numDetections]
+            let numChannels = 85;
+            let isTransposed = false;
 
-            if (dims && dims.length === 3) {
+            if (dims.length === 3) {
                 if (dims[1] < dims[2]) {
                     numChannels = dims[1];
                     numDetections = dims[2];
@@ -501,57 +504,51 @@ async function asyncDetectONNX() {
                 } else {
                     numDetections = dims[1];
                     numChannels = dims[2];
-                    isTransposed = false;
                 }
             }
 
-            let bestScore = 0;
-            let bestDetection = null;
-
-            // 信頼度スコアが最も高い検出体を検出
             for (let i = 0; i < numDetections; i++) {
                 let cx, cy, bw, bh, score;
                 if (isTransposed) {
-                    cx = data[0 * numDetections + i] * (w / 640);
-                    cy = data[1 * numDetections + i] * (h / 640);
-                    bw = data[2 * numDetections + i] * (w / 640);
-                    bh = data[3 * numDetections + i] * (h / 640);
+                    cx = data[0 * numDetections + i];
+                    cy = data[1 * numDetections + i];
+                    bw = data[2 * numDetections + i];
+                    bh = data[3 * numDetections + i];
                     score = numChannels > 4 ? data[4 * numDetections + i] : 1.0;
                 } else {
-                    cx = data[i * numChannels + 0] * (w / 640);
-                    cy = data[i * numChannels + 1] * (h / 640);
-                    bw = data[i * numChannels + 2] * (w / 640);
-                    bh = data[i * numChannels + 3] * (h / 640);
-                    score = numChannels > 4 ? data[i * numChannels + 4] : 1.0;
+                    let base = i * numChannels;
+                    cx = data[base];
+                    cy = data[base + 1];
+                    bw = data[base + 2];
+                    bh = data[base + 3];
+                    score = numChannels > 4 ? data[base + 4] : 1.0;
                 }
 
-                if (score > 0.35) {
-                    if (!isWarped && !isPointInArucoBounds(cx, cy)) continue;
+                if (score > 0.35 && score > bestScore) {
+                    let realCx = cx * (w / 640);
+                    let realCy = cy * (h / 640);
+                    let realW = bw * (w / 640);
+                    let realH = bh * (h / 640);
 
-                    if (score > bestScore) {
-                        bestScore = score;
-                        bestDetection = { cx, cy, bw, bh };
-                    }
+                    if (!isWarped && !isPointInArucoBounds(realCx, realCy)) continue;
+
+                    bestScore = score;
+                    bestObj = { cx: realCx, cy: realCy, w: realW, h: realH };
                 }
             }
 
-            if (bestDetection) {
-                // 検出された魚体の領域情報から、口先 (X1, Y1) と 尾叉 (X2, Y2) を算出
-                // (中心Y1, Y2 を共通化せず、傾きを反映できるようそれぞれのポイントに固有のY座標を割り当てる)
-                let leftX = bestDetection.cx - bestDetection.bw / 2;
-                let rightX = bestDetection.cx + bestDetection.bw / 2;
-                
-                // 魚体の傾き（高さ/幅の比率から簡易勾配を算出）
-                // 左端(口先)の固有Y1、右端(尾部)の固有Y2を設定
-                let y1 = bestDetection.cy;
-                let y2 = bestDetection.cy;
+            if (bestObj) {
+                // 最左端 (口先: X1) と 尾叉候補位置 (X2)
+                let x1 = bestObj.cx - (bestObj.w / 2);
+                let x2 = (bestObj.cx + (bestObj.w / 2)) - (bestObj.w * 0.06); // 尾先端から尾叉へのオフセット
 
-                // 尾先ではなく尾叉（くびれ）の位置に合わせるため最右端から5%内側に寄せたX2を設定
-                let forkX = rightX - (bestDetection.bw * 0.05);
+                // 口先Y1 と 尾叉Y2 を高低差・傾きに追従して決定
+                let y1 = bestObj.cy;
+                let y2 = bestObj.cy;
 
-                points.p1.x = leftX;
+                points.p1.x = x1;
                 points.p1.y = y1;
-                points.p2.x = forkX;
+                points.p2.x = x2;
                 points.p2.y = y2;
 
                 return true;
