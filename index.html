@@ -502,6 +502,7 @@ async function asyncDetectONNX() {
             const data = output.data;
             let bestScore = 0;
             let bestObj = null;
+            let bestIdx = -1;
 
             const dims = output.dims || [1, 85, 8400];
             let numDetections = 8400;
@@ -547,21 +548,148 @@ async function asyncDetectONNX() {
                     if (!isWarped && isPointInArucoBounds(realCx, realCy)) continue;
 
                     bestScore = score;
-                    bestObj = { cx: realCx, cy: realCy, w: realW, h: realH };
+                    bestIdx = i;
+                    bestObj = { cx: realCx, cy: realCy, w: realW, h: realH, rawCx: cx, rawCy: cy, rawW: bw, rawH: bh };
                 }
             }
 
             if (bestObj) {
-                let x1 = bestObj.cx - (bestObj.w / 2);
-                let x2 = (bestObj.cx + (bestObj.w / 2)) - (bestObj.w * 0.06); 
+                // セグメンテーションマスク（proto出力 + mask係数）が存在する場合、マスクピクセルの最左端・最右端を抽出
+                let leftmostPt = null;
+                let rightmostPt = null;
 
-                let y1 = bestObj.cy - (bestObj.h * 0.1);
-                let y2 = bestObj.cy + (bestObj.h * 0.1);
+                if (onnxSession.outputNames.length > 1 && numChannels >= 37) {
+                    const protoOutput = results[onnxSession.outputNames[1]];
+                    if (protoOutput && protoOutput.data && protoOutput.dims && protoOutput.dims.length === 4) {
+                        const protoData = protoOutput.data;
+                        const maskDim = protoOutput.dims[1]; // 通常32
+                        const maskH = protoOutput.dims[2];   // 通常160
+                        const maskW = protoOutput.dims[3];   // 通常160
 
-                points.p1.x = x1;
-                points.p1.y = y1;
-                points.p2.x = x2;
-                points.p2.y = y2;
+                        // 検出オブジェクトのmask係数を取得
+                        const maskCoeffs = new Float32Array(maskDim);
+                        const coeffStart = numChannels - maskDim;
+                        for (let m = 0; m < maskDim; m++) {
+                            maskCoeffs[m] = isTransposed
+                                ? data[(coeffStart + m) * numDetections + bestIdx]
+                                : data[bestIdx * numChannels + (coeffStart + m)];
+                        }
+
+                        // バウンディングボックス範囲（160x160マスク座標系）
+                        const scaleM = maskW / 640;
+                        const mx1 = Math.max(0, Math.floor((bestObj.rawCx - bestObj.rawW / 2) * scaleM));
+                        const mx2 = Math.min(maskW - 1, Math.ceil((bestObj.rawCx + bestObj.rawW / 2) * scaleM));
+                        const my1 = Math.max(0, Math.floor((bestObj.rawCy - bestObj.rawH / 2) * scaleM));
+                        const my2 = Math.min(maskH - 1, Math.ceil((bestObj.rawCy + bestObj.rawH / 2) * scaleM));
+
+                        let minX = Infinity, maxX = -Infinity;
+                        let leftYSum = 0, leftYCount = 0;
+                        let rightYSum = 0, rightYCount = 0;
+
+                        // マスク確率マップを評価し、魚体領域の最小X列・最大X列を特定
+                        const activeCols = new Map();
+                        for (let my = my1; my <= my2; my++) {
+                            for (let mx = mx1; mx <= mx2; mx++) {
+                                let sum = 0;
+                                const pixIdx = my * maskW + mx;
+                                for (let m = 0; m < maskDim; m++) {
+                                    sum += maskCoeffs[m] * protoData[m * maskH * maskW + pixIdx];
+                                }
+                                const prob = 1 / (1 + Math.exp(-sum)); // シグモイド
+                                if (prob > 0.5) {
+                                    if (!activeCols.has(mx)) activeCols.set(mx, []);
+                                    activeCols.get(mx).push(my);
+                                    if (mx < minX) minX = mx;
+                                    if (mx > maxX) maxX = mx;
+                                }
+                            }
+                        }
+
+                        if (minX <= maxX && activeCols.size > 0) {
+                            // 最左端（口先）のY座標（該当列の中央値）
+                            const leftYs = activeCols.get(minX);
+                            const leftMy = leftYs.reduce((a, b) => a + b, 0) / leftYs.length;
+                            const left640X = (minX + 0.5) / scaleM;
+                            const left640Y = (leftMy + 0.5) / scaleM;
+                            leftmostPt = {
+                                x: (left640X - dx) / scale,
+                                y: (left640Y - dy) / scale
+                            };
+
+                            // 最右端（尾叉：尾びれ先端から少し内側、または最右端列の窪み中央）の座標
+                            const spanX = maxX - minX;
+                            const forkMx = Math.max(minX, Math.round(maxX - spanX * 0.05));
+                            const rightYs = activeCols.get(forkMx) || activeCols.get(maxX);
+                            const rightMy = rightYs.reduce((a, b) => a + b, 0) / rightYs.length;
+                            const right640X = (forkMx + 0.5) / scaleM;
+                            const right640Y = (rightMy + 0.5) / scaleM;
+                            rightmostPt = {
+                                x: (right640X - dx) / scale,
+                                y: (right640Y - dy) / scale
+                            };
+                        }
+                    }
+                }
+
+                // セグメンテーションマスクから最左端・最右端が取得できた場合はその実座標を使用
+                if (leftmostPt && rightmostPt) {
+                    points.p1.x = leftmostPt.x;
+                    points.p1.y = leftmostPt.y;
+                    points.p2.x = rightmostPt.x;
+                    points.p2.y = rightmostPt.y;
+                } else {
+                    // マスク出力が無いモデル向けのバウンディングボックス内実ピクセル走査（角度固定を排除）
+                    const bx1 = Math.max(0, Math.floor(bestObj.cx - bestObj.w / 2));
+                    const by1 = Math.max(0, Math.floor(bestObj.cy - bestObj.h / 2));
+                    const bx2 = Math.min(w - 1, Math.ceil(bestObj.cx + bestObj.w / 2));
+                    const by2 = Math.min(h - 1, Math.ceil(bestObj.cy + bestObj.h / 2));
+                    const bwPx = bx2 - bx1;
+                    const bhPx = by2 - by1;
+
+                    let foundMinX = Infinity, foundMaxX = -Infinity;
+                    const colYs = new Map();
+
+                    if (bwPx > 10 && bhPx > 10) {
+                        const tCtx = targetCanvas.getContext('2d');
+                        const boxData = tCtx.getImageData(bx1, by1, bwPx, bhPx).data;
+                        for (let py = 0; py < bhPx; py += 2) {
+                            for (let px = 0; px < bwPx; px += 2) {
+                                const idx = (py * bwPx + px) * 4;
+                                const gray = 0.299 * boxData[idx] + 0.587 * boxData[idx + 1] + 0.114 * boxData[idx + 2];
+                                if (gray < 180) {
+                                    const absX = bx1 + px;
+                                    const absY = by1 + py;
+                                    if (!colYs.has(absX)) colYs.set(absX, []);
+                                    colYs.get(absX).push(absY);
+                                    if (absX < foundMinX) foundMinX = absX;
+                                    if (absX > foundMaxX) foundMaxX = absX;
+                                }
+                            }
+                        }
+                    }
+
+                    if (foundMinX < foundMaxX && colYs.size > 0) {
+                        const lYs = colYs.get(foundMinX);
+                        points.p1.x = foundMinX;
+                        points.p1.y = lYs.reduce((a, b) => a + b, 0) / lYs.length;
+
+                        const forkTargetX = Math.round(foundMaxX - (foundMaxX - foundMinX) * 0.05);
+                        let nearestX = foundMaxX;
+                        let minDiff = Infinity;
+                        for (const kx of colYs.keys()) {
+                            const d = Math.abs(kx - forkTargetX);
+                            if (d < minDiff) { minDiff = d; nearestX = kx; }
+                        }
+                        const rYs = colYs.get(nearestX);
+                        points.p2.x = nearestX;
+                        points.p2.y = rYs.reduce((a, b) => a + b, 0) / rYs.length;
+                    } else {
+                        points.p1.x = bestObj.cx - (bestObj.w / 2);
+                        points.p1.y = bestObj.cy;
+                        points.p2.x = (bestObj.cx + (bestObj.w / 2)) - (bestObj.w * 0.06);
+                        points.p2.y = bestObj.cy;
+                    }
+                }
 
                 return true;
             }
