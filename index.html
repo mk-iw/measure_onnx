@@ -289,7 +289,7 @@ function processArUcoDetection(imageSource) {
         for(let i=0; i<ids.length; i++) {
             for(let j=i+1; j<ids.length; j++) {
                 let dPx = Math.hypot(globalCorners[ids[i]].x - globalCorners[ids[j]].x, globalCorners[ids[i]].y - globalCorners[ids[j]].y);
-                tp += dPx; tm += Math.abs(ids[i]-ids[j]) * 50.0 * printScale;
+                tp += dPx; tm += Math.abs(ids[i]-ids[j]) * 50.0;
             }
         }
         ratio0_9 = tm / tp;
@@ -344,11 +344,8 @@ function warpImageToScale() {
 
     let tl = globalCorners[40], tr = globalCorners[41], br = globalCorners[43], bl = globalCorners[42];
     
-    let topW_px = Math.hypot(tr.tr.x - tl.tl.x, tr.tr.y - tl.tl.y);
-    let leftH_px = Math.hypot(bl.bl.x - tl.tl.x, bl.bl.y - tl.tl.y);
-    
-    let real_w_mm = topW_px * mmRatio;
-    let real_h_mm = leftH_px * mmRatio;
+    let real_w_mm = 506.0;
+    let real_h_mm = 187.0;
 
     const density = 2.0; 
     let tw = Math.round(real_w_mm * density);
@@ -360,10 +357,10 @@ function warpImageToScale() {
     try {
         let srcMat = cv.imread(lastCapturedFrame);
         let srcCoords = cv.matFromArray(4, 1, cv.CV_32FC2, [
-            tl.tl.x, tl.tl.y,
-            tr.tr.x, tr.tr.y,
-            br.br.x, br.br.y,
-            bl.bl.x, bl.bl.y
+            tl.x, tl.y,
+            tr.x, tr.y,
+            br.x, br.y,
+            bl.x, bl.y
         ]);
         
         let dstCoords = cv.matFromArray(4, 1, cv.CV_32FC2, [
