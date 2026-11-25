@@ -618,7 +618,7 @@ async function asyncDetectONNX() {
 
                             // 最右端（尾叉：尾びれ先端から少し内側、または最右端列の窪み中央）の座標
                             const spanX = maxX - minX;
-                            const forkMx = Math.max(minX, Math.round(maxX - spanX * 0.05));
+                            const forkMx = Math.max(minX, Math.round(maxX - spanX * 0.05*0));
                             const rightYs = activeCols.get(forkMx) || activeCols.get(maxX);
                             const rightMy = rightYs.reduce((a, b) => a + b, 0) / rightYs.length;
                             const right640X = (forkMx + 0.5) / scaleM;
@@ -673,7 +673,7 @@ async function asyncDetectONNX() {
                         points.p1.x = foundMinX;
                         points.p1.y = lYs.reduce((a, b) => a + b, 0) / lYs.length;
 
-                        const forkTargetX = Math.round(foundMaxX - (foundMaxX - foundMinX) * 0.05);
+                        const forkTargetX = Math.round(foundMaxX - (foundMaxX - foundMinX) * 0.05*0);
                         let nearestX = foundMaxX;
                         let minDiff = Infinity;
                         for (const kx of colYs.keys()) {
